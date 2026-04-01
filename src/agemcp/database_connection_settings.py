@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import AsyncGenerator, Self
@@ -9,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, a
 from typing_extensions import Literal
 
 from agemcp.data_source_name import DataSourceName
+
+TENANT_ID = os.environ.get('TENANT_ID', 'default')
 
 
 # ContextVar-based caches for event-loop safety
@@ -169,6 +172,9 @@ class DatabaseConnectionSettings(BaseModel):
                 "future": True
             }
             engine_kwargs = {k: v for k, v in engine_kwargs.items() if v is not None}
+            engine_kwargs["connect_args"] = {
+                "server_settings": {"app.tenant_id": TENANT_ID}
+            }
             engine = create_async_engine(str(self.dsn), **engine_kwargs)
             _async_engine_ctx.set(engine)
         return engine

@@ -1,4 +1,4 @@
-import json, logging, re
+import json, logging, os, re
 
 from pathlib import Path
 from textwrap import dedent
@@ -18,6 +18,22 @@ from agemcp.apache_age import AgPatch, ApacheAGE
 from agemcp.embeddings import get_embedder
 
 logger = logging.getLogger(__name__)
+
+# =====================================================
+# Tenant isolation for AGE graphs
+# =====================================================
+TENANT_ID = os.environ.get('TENANT_ID', 'default')
+_TENANT_PREFIX = f"t_{TENANT_ID}__"
+
+
+def _scoped(graph_name: str) -> str:
+    """Prefix graph name with tenant ID for isolation."""
+    return graph_name if graph_name.startswith(_TENANT_PREFIX) else _TENANT_PREFIX + graph_name
+
+
+def _unscoped(graph_name: str) -> str:
+    """Strip tenant prefix from graph name for display."""
+    return graph_name[len(_TENANT_PREFIX):] if graph_name.startswith(_TENANT_PREFIX) else graph_name
 
 # =====================================================
 # MCP Setup
@@ -188,7 +204,7 @@ async def generate_visualization(
         The path to the generated HTML file.
     """
     
-    graph = await age.get_graph(graph_name)
+    graph = await age.get_graph(_scoped(graph_name))
 
     file_path = await _write_visjs_single_page_html_app_to_file(graph)
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,8 +234,9 @@ async def drop_graphs(
     - Use to remove graphs and all their associated data.
     - Returns: Confirmation of the graph drop operation.
     """
-    for graph_name in graph_names:
-        await age.drop_graph(graph_name)
+    scoped = [_scoped(n) for n in graph_names]
+    for name in scoped:
+        await age.drop_graph(name)
     return {"status": "success", "graph_names": graph_names}
 
 # ====================================================================
@@ -236,7 +253,8 @@ async def list_graphs(ctx: Context) -> list[str]:
     - Returns: List of graph name strings.
     - Typical next step: select a graph for further operations (e.g., get_graph, add_vertex).
     """
-    return await age.get_graph_names()
+    all_names = await age.get_graph_names()
+    return [_unscoped(n) for n in all_names if n.startswith(_TENANT_PREFIX)]
 
 # ====================================================================
 # TOOL: get_or_create_graph
@@ -259,11 +277,13 @@ async def get_or_create_graph(
     - If the graph does not exist, it will be created.
     """
     
-    graph = await age.get_or_create_graph(graph_name)
-    
+    graph = await age.get_or_create_graph(_scoped(graph_name))
+
     await mutation_signal.send_async("get_or_create_graph", ctx=ctx, graph=graph)
-    
-    return graph.model_dump()
+
+    result = graph.model_dump()
+    result["name"] = _unscoped(result["name"])
+    return result
 
 # ====================================================================
 # TOOL: upsert_vertex
@@ -303,7 +323,7 @@ async def upsert_vertex(
         - insert a new vertex if it does not exist.
     
     """
-    graph = await age.get_graph(graph_name)
+    graph = await age.get_graph(_scoped(graph_name))
 
     if not (vertex := graph.get_vertex_by_ident(vertex_ident)):
         vertex = graph.add_vertex(
@@ -371,7 +391,7 @@ async def upsert_edge(
         - update or insert an edge's properties in a graph.
         - insert a new edge if it does not exist.
     """
-    graph = await age.get_graph(graph_name)
+    graph = await age.get_graph(_scoped(graph_name))
 
     if (edge := graph.edges.start_ident(edge_start_ident).end_ident(edge_end_ident).label(label).first()):
         edge.label = label
@@ -413,7 +433,7 @@ async def drop_vertex(
     - Returns: Confirmation string or not-found message.
     - Edges connected to this vertex may also be removed.
     """
-    graph = await age.get_graph(graph_name)
+    graph = await age.get_graph(_scoped(graph_name))
     vertex = graph.get_vertex_by_ident(vertex_ident)
     if not vertex:
         raise Exception(f"Vertex with ident '{vertex_ident}' not found in graph '{graph_name}', maybe you didn't use the correct vertex ident?")
@@ -448,7 +468,7 @@ async def drop_edge(
     - Use to delete an edge from the graph by its ident.
     - Returns: Confirmation string or not-found message.
     """
-    graph = await age.get_graph(graph_name)
+    graph = await age.get_graph(_scoped(graph_name))
     edge = graph.get_edge_by_ident(edge_ident)
     if not edge:
         return f"Edge '{edge_ident}' not found in graph '{graph_name}', maybe you didn't use the correct edge ident?"
@@ -583,7 +603,7 @@ async def upsert_graph(
     - Does NOT create a new graph if the specified graph does not exist.
     - Returns: The updated graph metadata as a dict.
 """
-    graph = await age.get_graph(graph_name)
+    graph = await age.get_graph(_scoped(graph_name))
     if not graph:
         raise ValueError(f"Graph '{graph_name}' does not exist. Make sure you're using the correct graph name.")
     
@@ -631,7 +651,7 @@ async def cypher_query(
     - Use for custom queries, aggregations, path-finding, or anything not covered by other tools.
     - Results are returned as decoded dictionaries.
     """
-    records = await age.cypher_fetch(graph_name, query)
+    records = await age.cypher_fetch(_scoped(graph_name), query)
     return [r.to_dict() for r in records]
 
 
@@ -671,7 +691,7 @@ async def search_vertices(
 
     cypher += f" RETURN n LIMIT {limit}"
 
-    records = await age.cypher_fetch(graph_name, cypher)
+    records = await age.cypher_fetch(_scoped(graph_name), cypher)
     results = [r.to_dict() for r in records]
     return {"total": len(results), "vertices": results}
 
@@ -702,7 +722,7 @@ async def search_edges(
     else:
         cypher = f"MATCH ()-[e]->() RETURN e LIMIT {limit}"
 
-    records = await age.cypher_fetch(graph_name, cypher)
+    records = await age.cypher_fetch(_scoped(graph_name), cypher)
     results = [r.to_dict() for r in records]
     return {"total": len(results), "edges": results}
 
@@ -742,8 +762,9 @@ async def get_neighbors(
     cypher_vertices = f"{pattern} WHERE start.{ident_prop} = '{vertex_ident}' RETURN DISTINCT neighbor"
     cypher_edges = f"MATCH (start {{ident: '{vertex_ident}'}})-[e]-(neighbor) RETURN e"
 
-    vertex_records = await age.cypher_fetch(graph_name, cypher_vertices)
-    edge_records = await age.cypher_fetch(graph_name, cypher_edges)
+    scoped = _scoped(graph_name)
+    vertex_records = await age.cypher_fetch(scoped, cypher_vertices)
+    edge_records = await age.cypher_fetch(scoped, cypher_edges)
 
     vertices = [r.to_dict() for r in vertex_records]
     edges = [r.to_dict() for r in edge_records]
@@ -778,8 +799,10 @@ async def export_graph(
     - Use to get a complete snapshot of a graph.
     - Output can be saved to a file or passed to import_graph to restore.
     """
-    graph = await age.get_graph(graph_name)
-    return graph.model_dump()
+    graph = await age.get_graph(_scoped(graph_name))
+    result = graph.model_dump()
+    result["name"] = _unscoped(result["name"])
+    return result
 
 
 # ====================================================================
@@ -814,7 +837,7 @@ async def import_graph(
     - Vertices need at minimum: label, properties (with ident inside).
     - Edges need at minimum: label, start_ident, end_ident, properties.
     """
-    graph = await age.get_or_create_graph(graph_name)
+    graph = await age.get_or_create_graph(_scoped(graph_name))
     graph = graph.deepcopy()
 
     for v in vertices:
@@ -829,7 +852,9 @@ async def import_graph(
 
     merged = await age.upsert_graph(graph)
     await mutation_signal.send_async("import_graph", ctx=ctx, graph=merged)
-    return merged.model_dump()
+    result = merged.model_dump()
+    result["name"] = _unscoped(result["name"])
+    return result
 
 
 # ====================================================================
@@ -860,8 +885,10 @@ async def semantic_search(
     if embedder is None:
         return {"error": "Vector search not available. Install with: pip install 'agemcp[vector]'"}
 
+    scoped = _scoped(graph_name)
+
     # Ensure vertices are embedded
-    await _sync_embeddings(graph_name, embedder)
+    await _sync_embeddings(scoped, embedder)
 
     # Embed query
     query_embedding = embedder.embed(query)
@@ -878,7 +905,7 @@ async def semantic_search(
                 ORDER BY embedding <=> :qvec::vector
                 LIMIT :limit
             """),
-            {"graph_name": graph_name, "qvec": str(query_embedding), "limit": limit}
+            {"graph_name": scoped, "qvec": str(query_embedding), "limit": limit}
         )
         rows = result.mappings().all()
 
@@ -918,7 +945,8 @@ async def graph_context(
     if embedder is None:
         return {"error": "Vector search not available. Install with: pip install 'agemcp[vector]'"}
 
-    await _sync_embeddings(graph_name, embedder)
+    scoped = _scoped(graph_name)
+    await _sync_embeddings(scoped, embedder)
 
     query_embedding = embedder.embed(query)
 
@@ -934,7 +962,7 @@ async def graph_context(
                 ORDER BY embedding <=> :qvec::vector
                 LIMIT :limit
             """),
-            {"graph_name": graph_name, "qvec": str(query_embedding), "limit": top_k}
+            {"graph_name": scoped, "qvec": str(query_embedding), "limit": top_k}
         )
         seeds = result.mappings().all()
 
@@ -951,7 +979,7 @@ async def graph_context(
             try:
                 ident_prop = "ident"
                 cypher = f"MATCH (start {{ident: '{ident}'}})-[*1..{depth}]-(neighbor) RETURN DISTINCT neighbor"
-                records = await age.cypher_fetch(graph_name, cypher)
+                records = await age.cypher_fetch(scoped, cypher)
                 part["neighbors"] = [r.to_dict() for r in records]
             except Exception as e:
                 part["neighbors_error"] = str(e)
@@ -971,9 +999,9 @@ async def graph_context(
 # Helper: sync vertex embeddings
 # ====================================================================
 
-async def _sync_embeddings(graph_name: str, embedder) -> None:
+async def _sync_embeddings(scoped_graph_name: str, embedder) -> None:
     """Ensure all vertices in the graph have up-to-date embeddings."""
-    graph = await age.get_graph(graph_name)
+    graph = await age.get_graph(scoped_graph_name)
 
     from agemcp.settings import get_settings
     dbs = get_settings().db.get_primary()
@@ -1045,7 +1073,7 @@ async def sync_to_openbrain(
     - Call this tool, then pass the returned 'memories' array to openbrain's store_batch tool.
     - This bridges the graph database with the semantic memory system.
     """
-    graph = await age.get_graph(graph_name)
+    graph = await age.get_graph(_scoped(graph_name))
 
     memories = []
     for v in graph.vertices:
@@ -1105,7 +1133,7 @@ async def import_from_openbrain(
     Returns:
         Import summary.
     """
-    graph = await age.get_or_create_graph(graph_name)
+    graph = await age.get_or_create_graph(_scoped(graph_name))
     graph = graph.deepcopy()
 
     tag_to_idents: Dict[str, list] = {}
@@ -1148,7 +1176,7 @@ async def import_from_openbrain(
     merged = await age.upsert_graph(graph)
     await mutation_signal.send_async("import_from_openbrain", ctx=ctx, graph=merged)
 
-    edge_count = len(merged.edges) - len((await age.get_graph(graph_name)).edges) if connect_by_tags else 0
+    edge_count = len(merged.edges) - len((await age.get_graph(_scoped(graph_name))).edges) if connect_by_tags else 0
     return {
         "graph_name": graph_name,
         "vertices_imported": len(memories),
