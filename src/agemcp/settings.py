@@ -150,16 +150,14 @@ def get_settings() -> Settings:
     current_env = Environment.current()
     global SETTINGS
     if SETTINGS.get(current_env, None) is None:
-        if current_env.is_production():
-            raise ValueError("Production environment is not supported yet.")
-        elif current_env.is_staging():
-            raise ValueError("Staging environment is not supported yet.")
-        elif current_env.is_testing():
+        if current_env.is_testing():
             SETTINGS[Environment.TESTING] = _SettingsTesting()  # pyright: ignore
         elif current_env.is_development():
             SETTINGS[Environment.DEVELOPMENT] = _SettingsDevelopment()  # pyright: ignore
+        elif current_env.is_production() or current_env.is_staging():
+            SETTINGS[current_env] = Settings()  # pyright: ignore
         else:
-            raise ValueError(f"Unsupported environment: {current_env.value}. Please set the environment to 'testing' or 'development'.")
+            raise ValueError(f"Unsupported environment: {current_env.value}.")
 
     settings = SETTINGS.get(current_env, None)
     if settings is None:
