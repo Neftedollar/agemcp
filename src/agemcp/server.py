@@ -1023,8 +1023,8 @@ async def sync_to_openbrain(
     ctx: Context,
     graph_name: Annotated[str, Field(description="Name of the graph to sync", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
     category: Annotated[str, Field(
-        description="OpenBrain memory category (must match openbrain enum)",
-        pattern=r"^(code-solution|bug-fix|architecture|learning|tool-usage|debugging|performance|security|observation|personal|relationship|other)$",
+        description="OpenBrain memory category (free-form, e.g. observation, architecture, tool-usage)",
+        min_length=1, max_length=64,
     )] = "observation",
     tag_prefix: Annotated[str, Field(description="Prefix for auto-generated tags")] = "graph",
 ) -> dict:
@@ -1035,9 +1035,7 @@ async def sync_to_openbrain(
 
     Args:
         graph_name: Name of the graph.
-        category: OpenBrain category. Valid values: code-solution, bug-fix, architecture,
-            learning, tool-usage, debugging, performance, security, observation,
-            personal, relationship, other.
+        category: OpenBrain category (free-form string, e.g. observation, architecture, tool-usage).
         tag_prefix: Tag prefix (e.g. 'graph' → tags include 'graph:person').
 
     Returns:
