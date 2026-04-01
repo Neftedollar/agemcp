@@ -1022,7 +1022,10 @@ async def _sync_embeddings(graph_name: str, embedder) -> None:
 async def sync_to_openbrain(
     ctx: Context,
     graph_name: Annotated[str, Field(description="Name of the graph to sync", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
-    category: Annotated[str, Field(description="OpenBrain memory category for all synced vertices")] = "observation",
+    category: Annotated[str, Field(
+        description="OpenBrain memory category (must match openbrain enum)",
+        pattern=r"^(code-solution|bug-fix|architecture|learning|tool-usage|debugging|performance|security|observation|personal|relationship|other)$",
+    )] = "observation",
     tag_prefix: Annotated[str, Field(description="Prefix for auto-generated tags")] = "graph",
 ) -> dict:
     """Export graph vertices as structured text suitable for openbrain-mcp store_batch.
@@ -1032,7 +1035,9 @@ async def sync_to_openbrain(
 
     Args:
         graph_name: Name of the graph.
-        category: OpenBrain category for all memories.
+        category: OpenBrain category. Valid values: code-solution, bug-fix, architecture,
+            learning, tool-usage, debugging, performance, security, observation,
+            personal, relationship, other.
         tag_prefix: Tag prefix (e.g. 'graph' → tags include 'graph:person').
 
     Returns:
