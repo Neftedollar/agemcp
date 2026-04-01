@@ -1,6 +1,6 @@
 [project]
 name = "agemcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "Apache AGE (PostgreSQL Graph) MCP Server"
 readme = "README.md"
 authors = [
@@ -21,6 +21,9 @@ dependencies = [
     "rich>=13.0.0",
     "sqlalchemy[asyncio]>=2.0.41",
 ]
+
+[project.optional-dependencies]
+vector = ["fastembed>=0.4.0"]
 
 [project.scripts]
 agemcp = "agemcp:cli.main"

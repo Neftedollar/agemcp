@@ -32,7 +32,7 @@ class McpSettings(BaseSettings):
     port: int = Field(default=7999, description="MCP server port")
     host: str = Field(default="0.0.0.0", description="MCP server host")
     transport: str = Field(
-        default="streamable-http",
+        default="stdio",
         description="MCP server transport protocol",
         pattern=r"^(sse|streamable-http|stdio)$"
     )

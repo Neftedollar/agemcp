@@ -1,4 +1,4 @@
-import json, re
+import json, logging, re
 
 from pathlib import Path
 from textwrap import dedent
@@ -11,10 +11,13 @@ from fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from pyvis.network import Network
+from sqlalchemy import text
 
 from agemcp.ag_graph import AgGraph
 from agemcp.apache_age import AgPatch, ApacheAGE
+from agemcp.embeddings import get_embedder
 
+logger = logging.getLogger(__name__)
 
 # =====================================================
 # MCP Setup
@@ -603,5 +606,551 @@ async def upsert_graph(
     await mutation_signal.send_async("upsert_graph", ctx=ctx, graph=merged_graph)
 
     return merged_graph.model_dump()
+
+
+# ====================================================================
+# TOOL: cypher_query
+# ====================================================================
+
+@mcp.tool(tags={"graph", "cypher", "query"}, annotations=ToolAnnotations(idempotentHint=True))
+async def cypher_query(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name of the graph to query", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+    query: Annotated[str, Field(description="Cypher query to execute (e.g. MATCH (n) RETURN n LIMIT 10)")],
+) -> list[dict]:
+    """Execute an arbitrary Cypher query on a graph and return results.
+
+    Args:
+        graph_name: Name of the graph.
+        query: Cypher query string.
+
+    Returns:
+        List of decoded agtype records.
+
+    LLM Usage:
+    - Use for custom queries, aggregations, path-finding, or anything not covered by other tools.
+    - Results are returned as decoded dictionaries.
+    """
+    records = await age.cypher_fetch(graph_name, query)
+    return [r.to_dict() for r in records]
+
+
+# ====================================================================
+# TOOL: search_vertices
+# ====================================================================
+
+@mcp.tool(tags={"vertex", "search", "query"}, annotations=ToolAnnotations(idempotentHint=True))
+async def search_vertices(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name of the graph", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+    label: Annotated[str | None, Field(description="Filter by vertex label")] = None,
+    property_key: Annotated[str | None, Field(description="Property key to filter on")] = None,
+    property_value: Annotated[str | None, Field(description="Property value to match (exact)")] = None,
+    limit: Annotated[int, Field(description="Max results", ge=1, le=500)] = 50,
+) -> dict:
+    """Search vertices by label and/or property value.
+
+    Args:
+        graph_name: Name of the graph.
+        label: Optional label filter.
+        property_key: Optional property key to filter on.
+        property_value: Optional value to match.
+        limit: Maximum results.
+
+    Returns:
+        Matching vertices.
+    """
+    if label:
+        cypher = f"MATCH (n:{label})"
+    else:
+        cypher = "MATCH (n)"
+
+    if property_key and property_value is not None:
+        safe_val = str(property_value).replace("'", "\\'")
+        cypher += f" WHERE n.{property_key} = '{safe_val}'"
+
+    cypher += f" RETURN n LIMIT {limit}"
+
+    records = await age.cypher_fetch(graph_name, cypher)
+    results = [r.to_dict() for r in records]
+    return {"total": len(results), "vertices": results}
+
+
+# ====================================================================
+# TOOL: search_edges
+# ====================================================================
+
+@mcp.tool(tags={"edge", "search", "query"}, annotations=ToolAnnotations(idempotentHint=True))
+async def search_edges(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name of the graph", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+    label: Annotated[str | None, Field(description="Filter by edge label")] = None,
+    limit: Annotated[int, Field(description="Max results", ge=1, le=500)] = 50,
+) -> dict:
+    """Search edges by label.
+
+    Args:
+        graph_name: Name of the graph.
+        label: Optional edge label filter.
+        limit: Maximum results.
+
+    Returns:
+        Matching edges.
+    """
+    if label:
+        cypher = f"MATCH ()-[e:{label}]->() RETURN e LIMIT {limit}"
+    else:
+        cypher = f"MATCH ()-[e]->() RETURN e LIMIT {limit}"
+
+    records = await age.cypher_fetch(graph_name, cypher)
+    results = [r.to_dict() for r in records]
+    return {"total": len(results), "edges": results}
+
+
+# ====================================================================
+# TOOL: get_neighbors
+# ====================================================================
+
+@mcp.tool(tags={"graph", "traversal", "query"}, annotations=ToolAnnotations(idempotentHint=True))
+async def get_neighbors(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name of the graph", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+    vertex_ident: Annotated[str, Field(description="Ident of the starting vertex", min_length=1, max_length=128, pattern=IDENT_PATTERN)],
+    depth: Annotated[int, Field(description="Max traversal depth (hops)", ge=1, le=5)] = 1,
+    direction: Annotated[str, Field(description="Traversal direction: out, in, or both")] = "both",
+) -> dict:
+    """Get N-hop neighbors of a vertex — useful for exploring graph context around an entity.
+
+    Args:
+        graph_name: Name of the graph.
+        vertex_ident: Ident of the starting vertex.
+        depth: Maximum hops (1-5).
+        direction: 'out' (outgoing), 'in' (incoming), or 'both'.
+
+    Returns:
+        Subgraph of vertices and edges within the traversal radius.
+    """
+    ident_prop = "ident"  # AGE stores ident in properties
+
+    if direction == "out":
+        pattern = f"MATCH (start)-[e*1..{depth}]->(neighbor)"
+    elif direction == "in":
+        pattern = f"MATCH (start)<-[e*1..{depth}]-(neighbor)"
+    else:
+        pattern = f"MATCH (start)-[e*1..{depth}]-(neighbor)"
+
+    cypher_vertices = f"{pattern} WHERE start.{ident_prop} = '{vertex_ident}' RETURN DISTINCT neighbor"
+    cypher_edges = f"MATCH (start {{ident: '{vertex_ident}'}})-[e]-(neighbor) RETURN e"
+
+    vertex_records = await age.cypher_fetch(graph_name, cypher_vertices)
+    edge_records = await age.cypher_fetch(graph_name, cypher_edges)
+
+    vertices = [r.to_dict() for r in vertex_records]
+    edges = [r.to_dict() for r in edge_records]
+
+    return {
+        "center": vertex_ident,
+        "depth": depth,
+        "direction": direction,
+        "vertices": vertices,
+        "edges": edges,
+    }
+
+
+# ====================================================================
+# TOOL: export_graph
+# ====================================================================
+
+@mcp.tool(tags={"graph", "export", "json"}, annotations=ToolAnnotations(idempotentHint=True))
+async def export_graph(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name of the graph to export", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+) -> dict:
+    """Export a graph as a JSON-serializable dict (vertices + edges + metadata).
+
+    Args:
+        graph_name: Name of the graph.
+
+    Returns:
+        Full graph representation as dict, suitable for backup or import_graph.
+
+    LLM Usage:
+    - Use to get a complete snapshot of a graph.
+    - Output can be saved to a file or passed to import_graph to restore.
+    """
+    graph = await age.get_graph(graph_name)
+    return graph.model_dump()
+
+
+# ====================================================================
+# TOOL: import_graph
+# ====================================================================
+
+@mcp.tool(tags={"graph", "import", "json", "mutation"}, annotations=ToolAnnotations(idempotentHint=False))
+async def import_graph(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name for the imported graph", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+    vertices: Annotated[List[dict], Field(
+        description="List of vertex dicts with at least 'label' and 'properties' (including 'ident')",
+        json_schema_extra={"type": "array", "items": {"type": "object"}},
+    )],
+    edges: Annotated[List[dict], Field(
+        description="List of edge dicts with 'label', 'start_ident', 'end_ident', 'properties'",
+        json_schema_extra={"type": "array", "items": {"type": "object"}},
+    )],
+) -> dict:
+    """Import a graph from JSON data (vertices + edges). Creates the graph if it doesn't exist.
+
+    Args:
+        graph_name: Name for the graph.
+        vertices: List of vertex dicts.
+        edges: List of edge dicts.
+
+    Returns:
+        The imported graph metadata.
+
+    LLM Usage:
+    - Use to restore a graph from export_graph output or construct a graph from external data.
+    - Vertices need at minimum: label, properties (with ident inside).
+    - Edges need at minimum: label, start_ident, end_ident, properties.
+    """
+    graph = await age.get_or_create_graph(graph_name)
+    graph = graph.deepcopy()
+
+    for v in vertices:
+        if "properties" not in v:
+            v["properties"] = {}
+        graph.upsert_vertex(v)
+
+    for e in edges:
+        if "properties" not in e:
+            e["properties"] = {}
+        graph.upsert_edge(e)
+
+    merged = await age.upsert_graph(graph)
+    await mutation_signal.send_async("import_graph", ctx=ctx, graph=merged)
+    return merged.model_dump()
+
+
+# ====================================================================
+# TOOL: semantic_search (requires fastembed + pgvector)
+# ====================================================================
+
+@mcp.tool(tags={"graph", "search", "vector", "semantic"}, annotations=ToolAnnotations(idempotentHint=True))
+async def semantic_search(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name of the graph to search", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+    query: Annotated[str, Field(description="Natural language search query")],
+    limit: Annotated[int, Field(description="Max results", ge=1, le=100)] = 10,
+) -> dict:
+    """Semantic similarity search over graph vertices using embeddings.
+
+    Requires: fastembed installed (pip install 'agemcp[vector]') and pgvector extension.
+    Vertices are auto-embedded on first search if not yet indexed.
+
+    Args:
+        graph_name: Name of the graph.
+        query: Natural language query.
+        limit: Max results.
+
+    Returns:
+        Matching vertices ranked by similarity.
+    """
+    embedder = get_embedder()
+    if embedder is None:
+        return {"error": "Vector search not available. Install with: pip install 'agemcp[vector]'"}
+
+    # Ensure vertices are embedded
+    await _sync_embeddings(graph_name, embedder)
+
+    # Embed query
+    query_embedding = embedder.embed(query)
+
+    from agemcp.settings import get_settings
+    dbs = get_settings().db.get_primary()
+
+    async with dbs.sqlalchemy_transaction() as session:
+        result = await session.execute(
+            text("""
+                SELECT vertex_ident, content, 1 - (embedding <=> :qvec::vector) AS similarity
+                FROM vertex_embeddings
+                WHERE graph_name = :graph_name
+                ORDER BY embedding <=> :qvec::vector
+                LIMIT :limit
+            """),
+            {"graph_name": graph_name, "qvec": str(query_embedding), "limit": limit}
+        )
+        rows = result.mappings().all()
+
+    return {
+        "query": query,
+        "total": len(rows),
+        "results": [{"vertex_ident": r["vertex_ident"], "content": r["content"], "similarity": round(float(r["similarity"]), 4)} for r in rows],
+    }
+
+
+# ====================================================================
+# TOOL: graph_context (Graph RAG — semantic search + N-hop traversal)
+# ====================================================================
+
+@mcp.tool(tags={"graph", "rag", "context", "semantic"}, annotations=ToolAnnotations(idempotentHint=True))
+async def graph_context(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name of the graph", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+    query: Annotated[str, Field(description="Natural language query to find relevant context")],
+    top_k: Annotated[int, Field(description="Number of seed vertices from semantic search", ge=1, le=20)] = 5,
+    depth: Annotated[int, Field(description="Hops to traverse from each seed vertex", ge=0, le=3)] = 1,
+) -> dict:
+    """Graph RAG: find semantically relevant vertices, then expand their neighborhood.
+
+    Combines semantic_search with get_neighbors to gather rich context from the graph.
+
+    Args:
+        graph_name: Name of the graph.
+        query: Natural language query.
+        top_k: How many seed vertices to retrieve.
+        depth: How many hops to expand around each seed.
+
+    Returns:
+        Seed vertices with their neighborhoods — ideal for grounding LLM responses.
+    """
+    embedder = get_embedder()
+    if embedder is None:
+        return {"error": "Vector search not available. Install with: pip install 'agemcp[vector]'"}
+
+    await _sync_embeddings(graph_name, embedder)
+
+    query_embedding = embedder.embed(query)
+
+    from agemcp.settings import get_settings
+    dbs = get_settings().db.get_primary()
+
+    async with dbs.sqlalchemy_transaction() as session:
+        result = await session.execute(
+            text("""
+                SELECT vertex_ident, content, 1 - (embedding <=> :qvec::vector) AS similarity
+                FROM vertex_embeddings
+                WHERE graph_name = :graph_name
+                ORDER BY embedding <=> :qvec::vector
+                LIMIT :limit
+            """),
+            {"graph_name": graph_name, "qvec": str(query_embedding), "limit": top_k}
+        )
+        seeds = result.mappings().all()
+
+    context_parts = []
+    for seed in seeds:
+        ident = seed["vertex_ident"]
+        part = {
+            "vertex_ident": ident,
+            "content": seed["content"],
+            "similarity": round(float(seed["similarity"]), 4),
+        }
+
+        if depth > 0:
+            try:
+                ident_prop = "ident"
+                cypher = f"MATCH (start {{ident: '{ident}'}})-[*1..{depth}]-(neighbor) RETURN DISTINCT neighbor"
+                records = await age.cypher_fetch(graph_name, cypher)
+                part["neighbors"] = [r.to_dict() for r in records]
+            except Exception as e:
+                part["neighbors_error"] = str(e)
+
+        context_parts.append(part)
+
+    return {
+        "query": query,
+        "graph_name": graph_name,
+        "seeds": len(context_parts),
+        "depth": depth,
+        "context": context_parts,
+    }
+
+
+# ====================================================================
+# Helper: sync vertex embeddings
+# ====================================================================
+
+async def _sync_embeddings(graph_name: str, embedder) -> None:
+    """Ensure all vertices in the graph have up-to-date embeddings."""
+    graph = await age.get_graph(graph_name)
+
+    from agemcp.settings import get_settings
+    dbs = get_settings().db.get_primary()
+
+    # Get existing embeddings
+    async with dbs.sqlalchemy_transaction() as session:
+        result = await session.execute(
+            text("SELECT vertex_ident FROM vertex_embeddings WHERE graph_name = :gn"),
+            {"gn": graph_name}
+        )
+        existing = {r["vertex_ident"] for r in result.mappings().all()}
+
+    # Find vertices that need embedding
+    to_embed = []
+    for v in graph.vertices:
+        if v.ident and v.ident not in existing:
+            content = f"{v.label}: {json.dumps(dict(v.properties), default=str)}"
+            to_embed.append((v.ident, content))
+
+    if not to_embed:
+        return
+
+    # Batch embed
+    idents, contents = zip(*to_embed)
+    embeddings = embedder.embed_batch(list(contents))
+
+    # Store
+    async with dbs.sqlalchemy_transaction() as session:
+        for ident, content, emb in zip(idents, contents, embeddings):
+            await session.execute(
+                text("""
+                    INSERT INTO vertex_embeddings (graph_name, vertex_ident, content, embedding)
+                    VALUES (:gn, :vi, :content, :emb::vector)
+                    ON CONFLICT (graph_name, vertex_ident) DO UPDATE
+                    SET content = :content, embedding = :emb::vector, updated_at = NOW()
+                """),
+                {"gn": graph_name, "vi": ident, "content": content, "emb": str(emb)}
+            )
+
+
+# ====================================================================
+# TOOL: sync_to_openbrain (bridge to openbrain-mcp)
+# ====================================================================
+
+@mcp.tool(tags={"graph", "openbrain", "bridge", "export"}, annotations=ToolAnnotations(idempotentHint=True))
+async def sync_to_openbrain(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name of the graph to sync", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+    category: Annotated[str, Field(description="OpenBrain memory category for all synced vertices")] = "observation",
+    tag_prefix: Annotated[str, Field(description="Prefix for auto-generated tags")] = "graph",
+) -> dict:
+    """Export graph vertices as structured text suitable for openbrain-mcp store_batch.
+
+    Does NOT call openbrain directly (they are separate MCP servers). Instead, returns
+    a ready-to-use payload that the LLM can pass to openbrain's store_batch tool.
+
+    Args:
+        graph_name: Name of the graph.
+        category: OpenBrain category for all memories.
+        tag_prefix: Tag prefix (e.g. 'graph' → tags include 'graph:person').
+
+    Returns:
+        A dict with 'memories' array formatted for openbrain store_batch.
+
+    LLM Usage:
+    - Call this tool, then pass the returned 'memories' array to openbrain's store_batch tool.
+    - This bridges the graph database with the semantic memory system.
+    """
+    graph = await age.get_graph(graph_name)
+
+    memories = []
+    for v in graph.vertices:
+        props = dict(v.properties) if v.properties else {}
+        props_str = ", ".join(f"{k}={v}" for k, v in props.items() if k not in ("ident", "start_ident", "end_ident"))
+        content = f"[{v.label}] {v.ident}"
+        if props_str:
+            content += f" — {props_str}"
+
+        # Include edge context
+        connected = []
+        for e in graph.edges:
+            if e.start_ident == v.ident:
+                connected.append(f"—{e.label}→ {e.end_ident}")
+            elif e.end_ident == v.ident:
+                connected.append(f"←{e.label}— {e.start_ident}")
+        if connected:
+            content += f". Relations: {'; '.join(connected)}"
+
+        tags = [f"{tag_prefix}:{graph_name}", f"{tag_prefix}:{v.label}"]
+        memories.append({"content": content, "category": category, "tags": tags})
+
+    return {
+        "graph_name": graph_name,
+        "vertex_count": len(memories),
+        "memories": memories,
+        "usage_hint": "Pass the 'memories' array to openbrain's store_batch tool to sync.",
+    }
+
+
+# ====================================================================
+# TOOL: import_from_openbrain (bridge from openbrain-mcp)
+# ====================================================================
+
+@mcp.tool(tags={"graph", "openbrain", "bridge", "import", "mutation"}, annotations=ToolAnnotations(idempotentHint=False))
+async def import_from_openbrain(
+    ctx: Context,
+    graph_name: Annotated[str, Field(description="Name of the graph to import into", min_length=1, max_length=128, pattern=GRAPH_NAME_PATTERN)],
+    memories: Annotated[List[dict], Field(
+        description="Array of openbrain memories (each with 'id', 'content', 'category', 'tags')",
+        json_schema_extra={"type": "array", "items": {"type": "object"}},
+    )],
+    connect_by_tags: Annotated[bool, Field(description="Auto-create edges between memories sharing tags")] = True,
+) -> dict:
+    """Import openbrain memories as graph vertices, optionally connecting them by shared tags.
+
+    LLM Usage:
+    - First call openbrain's search or list_recent to get memories.
+    - Then pass the results here to build a knowledge graph from memories.
+    - If connect_by_tags=True, memories with shared tags get SHARES_TAG edges.
+
+    Args:
+        graph_name: Target graph name.
+        memories: Array of openbrain memory objects.
+        connect_by_tags: Whether to auto-create edges for shared tags.
+
+    Returns:
+        Import summary.
+    """
+    graph = await age.get_or_create_graph(graph_name)
+    graph = graph.deepcopy()
+
+    tag_to_idents: Dict[str, list] = {}
+
+    for mem in memories:
+        mem_id = str(mem.get("id", ""))
+        if not mem_id:
+            continue
+
+        ident = f"ob_{mem_id[:12]}"
+        content = mem.get("content", "")
+        category = mem.get("category", "other")
+        tags = mem.get("tags", [])
+
+        graph.upsert_vertex({
+            "label": category,
+            "ident": ident,
+            "properties": {
+                "content": content,
+                "openbrain_id": mem_id,
+                "tags": tags,
+                "source": "openbrain",
+            }
+        })
+
+        for tag in tags:
+            tag_to_idents.setdefault(tag, []).append(ident)
+
+    if connect_by_tags:
+        for tag, idents in tag_to_idents.items():
+            for i in range(len(idents)):
+                for j in range(i + 1, len(idents)):
+                    graph.upsert_edge({
+                        "label": "SHARES_TAG",
+                        "start_ident": idents[i],
+                        "end_ident": idents[j],
+                        "properties": {"tag": tag},
+                    })
+
+    merged = await age.upsert_graph(graph)
+    await mutation_signal.send_async("import_from_openbrain", ctx=ctx, graph=merged)
+
+    edge_count = len(merged.edges) - len((await age.get_graph(graph_name)).edges) if connect_by_tags else 0
+    return {
+        "graph_name": graph_name,
+        "vertices_imported": len(memories),
+        "edges_created": edge_count,
+        "message": "Memories imported as vertices. Use get_neighbors or graph_context to explore.",
+    }
 
 

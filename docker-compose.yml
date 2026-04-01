@@ -1,0 +1,20 @@
+services:
+  db:
+    build: .
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_USER: agemcp
+      POSTGRES_PASSWORD: agemcp
+      POSTGRES_DB: agemcp
+    volumes:
+      - agemcp_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agemcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  agemcp_data:
