@@ -287,14 +287,16 @@ if ENV_PATH.exists():
             console.log(f"Running server via direct import: {server_spec}")
 
         # Map CLI args to run_command
-        asyncio.run(run_command(
-            server_spec=server_spec,
-            transport=cast(TransportType, transport),
-            host=host,
-            port=port,
-            log_level=cast(LogLevelType, log_level),
-            show_banner=True
-        ))
+        kwargs = {
+            "server_spec": server_spec,
+            "transport": cast(TransportType, transport),
+            "log_level": cast(LogLevelType, log_level),
+        }
+        # host/port only for HTTP transports, not stdio
+        if transport != "stdio":
+            kwargs["host"] = host
+            kwargs["port"] = port
+        asyncio.run(run_command(**kwargs))
     
 def main() -> None:
     """
